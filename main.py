@@ -175,7 +175,11 @@ def is_public_ip(ip_str: str) -> bool:
 def host_allowed_and_public(hostname: str) -> (bool, str):
     if hostname is None:
         return False, "missing host"
-    host = hostname.lower().rstrip(".")
+    # Exact match only -- no trailing-dot or other normalization. A host
+    # like "example.com." LOOKS the same but is not the literal allowed
+    # string, so it is treated as not allowed rather than being folded
+    # into a match.
+    host = hostname.lower()
     if host not in ALLOWED_HOSTS:
         return False, f"host not in allowlist: {host}"
 
@@ -196,6 +200,14 @@ def host_allowed_and_public(hostname: str) -> (bool, str):
 
 
 def validate_url(url: str):
+    """Return (ok: bool, reason: str, parsed) for a single URL, without
+    following redirects."""
+    if url is None:
+        return False, "missing url", None
+
+    if any(c in url for c in ("\r", "\n", "\t", " ", "\x00")):
+        return False, "control/whitespace characters in url", None
+
     try:
         parsed = urlparse(url)
     except Exception as e:
@@ -210,14 +222,30 @@ def validate_url(url: str):
     if not parsed.hostname:
         return False, "missing host", None
 
-    if parsed.port not in (None, 80, 443):
-        return False, f"disallowed port: {parsed.port}", None
+    try:
+        port = parsed.port
+    except ValueError:
+        return False, "invalid port", None
+
+    if port not in (None, 80, 443):
+        return False, f"disallowed port: {port}", None
+
+    # Defense in depth: rebuild the expected netloc from the parsed
+    # hostname/port and make sure nothing extra is hiding in the raw
+    # netloc that the hostname/port properties glossed over.
+    expected_netloc = parsed.hostname.lower()
+    if port is not None:
+        expected_netloc += f":{port}"
+    if parsed.netloc.lower() != expected_netloc:
+        return False, "netloc does not match parsed host:port", None
 
     ok, reason = host_allowed_and_public(parsed.hostname)
     if not ok:
         return False, reason, None
 
     return True, "ok", parsed
+
+
 
 
 def do_fetch_url(url: str):
