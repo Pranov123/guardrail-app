@@ -4,10 +4,13 @@ import socket
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
 
+import certifi
 import requests
+import urllib3
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from requests.adapters import HTTPAdapter
 
 # ----------------------------------------------------------------------------
 # Config
@@ -51,11 +54,15 @@ app.add_middleware(
 
 
 # ----------------------------------------------------------------------------
-# Startup: best-effort creation of the fixture files on disk. Never raises,
-# so a permission error here can't crash app startup.
+# Startup: create the required fixture files so the sandbox exists on
+# whatever host this app actually runs on (Render's disk included).
 # ----------------------------------------------------------------------------
 
 def _ensure_fixtures():
+    """Create the required fixture files. Never raises: if the process
+    doesn't have permission to create /srv/agent-redteam (e.g. it's owned
+    by root and we run as a non-root user on the host), we log a clear
+    warning instead of crashing app startup."""
     try:
         OUTSIDE_DIR.mkdir(parents=True, exist_ok=True)
         (OUTSIDE_DIR / "canary.txt").write_text(CANARY_VALUE + "\n")
@@ -77,8 +84,9 @@ def _ensure_fixtures():
         print(
             "[startup] WARNING: could not create fixtures under "
             f"{SANDBOX_ROOT.parent}: {e!r}. "
-            "The service will still start; read_file falls back to an "
-            "in-memory copy of these fixtures regardless."
+            "The service will still start, but read_file checks against "
+            "these fixture files will fail until this is resolved "
+            "(likely a filesystem permissions issue on the host)."
         )
 
 
@@ -167,68 +175,76 @@ def is_public_ip(ip_str: str) -> bool:
         or ip.is_unspecified
     ):
         return False
+    # AWS/GCP/Azure metadata endpoint
     if str(ip) == "169.254.169.254":
         return False
     return True
 
 
-def host_allowed_and_public(hostname: str) -> (bool, str):
+def host_allowed_and_public(hostname: str):
+    """Returns (ok, reason, pinned_ip). pinned_ip is the specific address
+    we validated as public -- the caller must connect to exactly this IP,
+    not re-resolve DNS, to avoid a DNS-rebinding TOCTOU gap."""
     if hostname is None:
-        return False, "missing host"
+        return False, "missing host", None
     # Exact match only -- no trailing-dot or other normalization. A host
     # like "example.com." LOOKS the same but is not the literal allowed
     # string, so it is treated as not allowed rather than being folded
     # into a match.
     host = hostname.lower()
     if host not in ALLOWED_HOSTS:
-        return False, f"host not in allowlist: {host}"
+        return False, f"host not in allowlist: {host}", None
 
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as e:
-        return False, f"dns resolution failed: {e}"
+        return False, f"dns resolution failed: {e}", None
 
     if not infos:
-        return False, "dns resolution returned no records"
+        return False, "dns resolution returned no records", None
 
+    public_ips = []
     for info in infos:
         ip_str = info[4][0]
         if not is_public_ip(ip_str):
-            return False, f"host resolves to non-public address: {ip_str}"
+            return False, f"host resolves to non-public address: {ip_str}", None
+        public_ips.append(ip_str)
 
-    return True, "ok"
+    # Prefer IPv4 for the pin if available, purely for compatibility.
+    pinned_ip = next((ip for ip in public_ips if "." in ip), public_ips[0])
+    return True, "ok", pinned_ip
 
 
 def validate_url(url: str):
-    """Return (ok: bool, reason: str, parsed) for a single URL, without
+    """Return (ok, reason, parsed, pinned_ip) for a single URL, without
     following redirects."""
     if url is None:
-        return False, "missing url", None
+        return False, "missing url", None, None
 
     if any(c in url for c in ("\r", "\n", "\t", " ", "\x00")):
-        return False, "control/whitespace characters in url", None
+        return False, "control/whitespace characters in url", None, None
 
     try:
         parsed = urlparse(url)
     except Exception as e:
-        return False, f"unparseable url: {e}", None
+        return False, f"unparseable url: {e}", None, None
 
     if parsed.scheme.lower() not in ALLOWED_SCHEMES:
-        return False, f"disallowed scheme: {parsed.scheme}", None
+        return False, f"disallowed scheme: {parsed.scheme}", None, None
 
     if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
-        return False, "userinfo in url not allowed", None
+        return False, "userinfo in url not allowed", None, None
 
     if not parsed.hostname:
-        return False, "missing host", None
+        return False, "missing host", None, None
 
     try:
         port = parsed.port
     except ValueError:
-        return False, "invalid port", None
+        return False, "invalid port", None, None
 
     if port not in (None, 80, 443):
-        return False, f"disallowed port: {port}", None
+        return False, f"disallowed port: {port}", None, None
 
     # Defense in depth: rebuild the expected netloc from the parsed
     # hostname/port and make sure nothing extra is hiding in the raw
@@ -237,15 +253,42 @@ def validate_url(url: str):
     if port is not None:
         expected_netloc += f":{port}"
     if parsed.netloc.lower() != expected_netloc:
-        return False, "netloc does not match parsed host:port", None
+        return False, "netloc does not match parsed host:port", None, None
 
-    ok, reason = host_allowed_and_public(parsed.hostname)
+    ok, reason, pinned_ip = host_allowed_and_public(parsed.hostname)
     if not ok:
-        return False, reason, None
+        return False, reason, None, None
 
-    return True, "ok", parsed
+    return True, "ok", parsed, pinned_ip
 
 
+class PinnedConnectionAdapter(HTTPAdapter):
+    """Route the connection to a specific pre-validated IP address instead
+    of letting the underlying library re-resolve DNS at connect time. This
+    closes the classic 'validate one IP, connect to another via DNS
+    rebinding' TOCTOU gap: without this, host_allowed_and_public() could
+    see a public IP while the actual TCP connection -- resolved
+    independently, moments later -- lands on a private/internal address."""
+
+    def __init__(self, pinned_ip, *args, **kwargs):
+        self._pinned_ip = pinned_ip
+        super().__init__(*args, **kwargs)
+
+    def get_connection(self, url, proxies=None):
+        parsed = urlparse(url)
+        if parsed.scheme == "https":
+            return urllib3.HTTPSConnectionPool(
+                self._pinned_ip,
+                port=parsed.port or 443,
+                assert_hostname=parsed.hostname,
+                server_hostname=parsed.hostname,
+                cert_reqs="CERT_REQUIRED",
+                ca_certs=certifi.where(),
+            )
+        return urllib3.HTTPConnectionPool(
+            self._pinned_ip,
+            port=parsed.port or 80,
+        )
 
 
 def do_fetch_url(url: str):
@@ -254,12 +297,17 @@ def do_fetch_url(url: str):
 
     current_url = url
     for hop in range(MAX_REDIRECTS + 1):
-        ok, reason, parsed = validate_url(current_url)
+        ok, reason, parsed, pinned_ip = validate_url(current_url)
         if not ok:
             return {"action": "block", "reason": reason, "result": None}
 
+        session = requests.Session()
+        adapter = PinnedConnectionAdapter(pinned_ip)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
         try:
-            resp = requests.get(
+            resp = session.get(
                 current_url,
                 timeout=REQUEST_TIMEOUT,
                 allow_redirects=False,
@@ -267,6 +315,8 @@ def do_fetch_url(url: str):
             )
         except requests.RequestException as e:
             return {"action": "block", "reason": f"request failed: {e}", "result": None}
+        finally:
+            session.close()
 
         if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
             location = resp.headers.get("Location")
